@@ -137,77 +137,160 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
     result
 }
 
+// A "part" entry. `start` is the byte offset into `piece` where this part begins.
+// `rank` is the rank of the pair (this part, next live part). `next` is the index of the
+// next live part in `parts` (linked-list / tombstone scheme). Dead parts have
+// `rank == Rank::MAX` and are skipped via `next`. `parts[len-1]` is always a sentinel.
+#[derive(Clone, Copy)]
+struct Part {
+    start: usize,
+    rank: Rank,
+    next: u32,
+    prev: u32,
+}
+
 fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize, Rank)> {
-    // This is a vector of (start, rank).
-    // The rank is of the pair starting at position start.
-    let mut parts = Vec::with_capacity(piece.len() + 1);
+    // This is a vector of Parts. Indices instead of removals — merged-out parts are tombstoned
+    // and `next`/`prev` skip over them.
+    let n = piece.len();
+    let mut parts: Vec<Part> = Vec::with_capacity(n + 1);
 
     // Note that we hash bytes when indexing into `ranks`, not token pairs. As long as we train BPE
     // the way we currently do, this is equivalent. An easy way to break this would be to decouple
     // merge priority from token index or to prevent specific token merges.
-    let mut min_rank: (Rank, usize) = (Rank::MAX, usize::MAX);
-    for i in 0..piece.len() - 1 {
+    let mut min_rank: (Rank, u32) = (Rank::MAX, u32::MAX);
+    for i in 0..n - 1 {
         let rank = *ranks.get(&piece[i..i + 2]).unwrap_or(&Rank::MAX);
         if rank < min_rank.0 {
-            min_rank = (rank, i);
+            min_rank = (rank, i as u32);
         }
-        parts.push((i, rank));
+        parts.push(Part {
+            start: i,
+            rank,
+            next: (i as u32) + 1,
+            prev: (i as u32).wrapping_sub(1),
+        });
     }
-    parts.push((piece.len() - 1, Rank::MAX));
-    parts.push((piece.len(), Rank::MAX));
+    parts.push(Part {
+        start: n - 1,
+        rank: Rank::MAX,
+        next: n as u32,
+        prev: (n as u32).wrapping_sub(2),
+    });
+    parts.push(Part {
+        start: n,
+        rank: Rank::MAX,
+        next: u32::MAX,
+        prev: (n as u32).wrapping_sub(1),
+    });
 
-    let get_rank = {
-        #[inline(always)]
-        |parts: &Vec<(usize, Rank)>, i: usize| {
-            if (i + 3) < parts.len() {
-                // Similar to `piece[i..i + 2]` above. The +3 is because we haven't yet deleted
-                // parts[i + 1], see comment in the main loop.
-                *ranks
-                    .get(&piece[parts[i].0..parts[i + 3].0])
-                    .unwrap_or(&Rank::MAX)
-            } else {
-                Rank::MAX
-            }
+    // Compute rank of the pair (parts[i], parts[next_i]) — i.e. the merged segment is
+    // piece[parts[i].start .. parts[ parts[next_i].next ].start]. Returns Rank::MAX if no
+    // such pair exists or no rank is found.
+    #[inline(always)]
+    fn pair_rank(
+        ranks: &HashMap<Vec<u8>, Rank>,
+        piece: &[u8],
+        parts: &[Part],
+        i: u32,
+    ) -> Rank {
+        let next_i = parts[i as usize].next;
+        if next_i as usize >= parts.len() {
+            return Rank::MAX;
         }
-    };
+        let after = parts[next_i as usize].next;
+        if after as usize >= parts.len() {
+            return Rank::MAX;
+        }
+        let end = parts[after as usize].start;
+        *ranks
+            .get(&piece[parts[i as usize].start..end])
+            .unwrap_or(&Rank::MAX)
+    }
 
     // If you have n parts and m merges, this does O(mn) work.
-    // We could do something with a heap and do O(m log n) work.
-    // n is often very small so considerations like cache-locality outweigh the algorithmic
-    // complexity downsides of the `parts` vector.
     while min_rank.0 != Rank::MAX {
-        let i = min_rank.1;
-        // Update parts[i] and parts[i - 1] before removing parts[i + 1], since
-        // `parts.remove(i + 1)` will thrash the cache.
-        if i > 0 {
-            parts[i - 1].1 = get_rank(&parts, i - 1);
-        }
-        parts[i].1 = get_rank(&parts, i);
-        parts.remove(i + 1);
+        let i = min_rank.1 as usize;
+        // Index of the right-hand neighbour we're merging into `i`.
+        let j = parts[i].next as usize;
 
-        min_rank = (Rank::MAX, usize::MAX);
-        for (i, &(_, rank)) in parts[..parts.len() - 1].iter().enumerate() {
-            if rank < min_rank.0 {
-                min_rank = (rank, i);
+        // Update parts[i].rank to the new pair (i, next(j)).
+        // We must do this BEFORE unlinking j, because pair_rank walks `next` pointers.
+        // But for pair_rank(i) we want it to span (i, after_j). After unlink, parts[i].next == after_j,
+        // so it's the same. Order: unlink j first to make pair_rank(i) and pair_rank(prev_i) correct.
+        let after_j = parts[j].next;
+        let prev_i = parts[i].prev;
+
+        // Unlink j (tombstone — no Vec::remove memmove).
+        parts[i].next = after_j;
+        if (after_j as usize) < parts.len() {
+            parts[after_j as usize].prev = i as u32;
+        }
+        parts[j].rank = Rank::MAX;
+
+        // Refresh ranks at the two boundaries.
+        parts[i].rank = pair_rank(ranks, piece, &parts, i as u32);
+        if prev_i != u32::MAX {
+            parts[prev_i as usize].rank = pair_rank(ranks, piece, &parts, prev_i);
+        }
+
+        // Find the next minimum by walking the live list.
+        min_rank = (Rank::MAX, u32::MAX);
+        let mut k = 0u32;
+        let last = (parts.len() - 1) as u32;
+        while k != last && (k as usize) < parts.len() {
+            let p = &parts[k as usize];
+            if p.rank < min_rank.0 {
+                min_rank = (p.rank, k);
             }
+            k = p.next;
         }
     }
-    parts
+
+    // Walk the linked list to produce the (start, rank) output Vec the callers expect.
+    let mut out: Vec<(usize, Rank)> = Vec::with_capacity(16);
+    let mut k = 0u32;
+    while (k as usize) < parts.len() {
+        let p = &parts[k as usize];
+        out.push((p.start, p.rank));
+        if p.next == u32::MAX {
+            break;
+        }
+        k = p.next;
+    }
+    out
 }
 
 pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
+    let mut out = Vec::new();
+    byte_pair_encode_into(piece, ranks, &mut out);
+    out
+}
+
+/// Like `byte_pair_encode`, but writes tokens directly into the caller's `Vec`,
+/// avoiding the intermediate allocation+copy a `Vec<Rank>` return value implies.
+#[inline]
+pub fn byte_pair_encode_into(
+    piece: &[u8],
+    ranks: &HashMap<Vec<u8>, Rank>,
+    out: &mut Vec<Rank>,
+) {
     let piece_len = piece.len();
 
     if piece_len == 1 {
-        return vec![ranks[piece]];
+        out.push(ranks[piece]);
+        return;
     }
     if piece_len < 100 {
-        return _byte_pair_merge(ranks, piece)
-            .windows(2)
-            .map(|part| ranks[&piece[part[0].0..part[1].0]])
-            .collect();
+        let parts = _byte_pair_merge(ranks, piece);
+        out.reserve(parts.len().saturating_sub(1));
+        for w in parts.windows(2) {
+            out.push(ranks[&piece[w[0].0..w[1].0]]);
+        }
+        return;
     }
-    _byte_pair_merge_large(ranks, piece)
+    let large = _byte_pair_merge_large(ranks, piece);
+    out.extend_from_slice(&large);
 }
 
 pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<&'a [u8]> {
@@ -361,12 +444,19 @@ impl CoreBPE {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
         let regex = self._get_tl_regex();
-        let mut ret = vec![];
+        let encoder = &self.encoder;
+        // Heuristic: average BPE token in English ~ 4 bytes.
+        let mut ret = Vec::with_capacity(text.len() / 4 + 1);
         for mat in regex.find_iter(text) {
             let piece = mat.unwrap().as_str().as_bytes();
-            match self.encoder.get(piece) {
-                Some(token) => ret.push(*token),
-                None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
+            if piece.len() == 1 {
+                // Single-byte pieces are always in the encoder; skip the double-lookup.
+                ret.push(encoder[piece]);
+                continue;
+            }
+            match encoder.get(piece) {
+                Some(&token) => ret.push(token),
+                None => byte_pair_encode_into(piece, encoder, &mut ret),
             }
         }
         ret
@@ -379,7 +469,8 @@ impl CoreBPE {
     ) -> Result<(Vec<Rank>, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
         let regex = self._get_tl_regex();
-        let mut ret = vec![];
+        let encoder = &self.encoder;
+        let mut ret = Vec::with_capacity(text.len() / 4 + 1);
 
         let mut start = 0;
         let mut last_piece_token_len = 0;
@@ -413,14 +504,19 @@ impl CoreBPE {
                 };
 
                 let piece = mat.as_str().as_bytes();
-                if let Some(token) = self.encoder.get(piece) {
+                if piece.len() == 1 {
                     last_piece_token_len = 1;
-                    ret.push(*token);
+                    ret.push(encoder[piece]);
                     continue;
                 }
-                let tokens = byte_pair_encode(piece, &self.encoder);
-                last_piece_token_len = tokens.len();
-                ret.extend(&tokens);
+                if let Some(&token) = encoder.get(piece) {
+                    last_piece_token_len = 1;
+                    ret.push(token);
+                    continue;
+                }
+                let before = ret.len();
+                byte_pair_encode_into(piece, encoder, &mut ret);
+                last_piece_token_len = ret.len() - before;
             }
 
             match next_special {
