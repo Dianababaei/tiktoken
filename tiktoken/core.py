@@ -307,7 +307,7 @@ class Encoding:
         >>> enc.decode_tokens_bytes([31373, 995])
         [b'hello', b' world']
         """
-        return [self.decode_single_token_bytes(token) for token in tokens]
+        return self._core_bpe.decode_tokens_bytes(tokens)
 
     def decode_with_offsets(self, tokens: Sequence[int]) -> tuple[str, list[int]]:
         """Decodes a list of tokens into a string and a list of offsets.
@@ -322,17 +322,7 @@ class Encoding:
         >>> enc.decode_with_offsets([31373, 995])
         ('hello world', [0, 5])
         """
-        token_bytes = self.decode_tokens_bytes(tokens)
-
-        text_len = 0
-        offsets = []
-        for token in token_bytes:
-            offsets.append(max(0, text_len - (0x80 <= token[0] < 0xC0)))
-            text_len += sum(1 for c in token if not 0x80 <= c < 0xC0)
-
-        # TODO: assess correctness for errors="ignore" and errors="replace"
-        text = b"".join(token_bytes).decode("utf-8", errors="strict")
-        return text, offsets
+        return self._core_bpe.decode_with_offsets(tokens)
 
     def decode_batch(
         self, batch: Sequence[Sequence[int]], *, errors: str = "replace", num_threads: int = 8
