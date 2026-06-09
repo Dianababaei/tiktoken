@@ -171,6 +171,53 @@ impl CoreBPE {
         Err(PyErr::new::<exceptions::PyKeyError, _>(token.to_string()))
     }
 
+    fn decode_tokens_bytes(&self, py: Python, tokens: Vec<Rank>) -> PyResult<Vec<Py<PyBytes>>> {
+        let mut result = Vec::with_capacity(tokens.len());
+        for token in tokens {
+            if let Some(bytes) = self.decoder.get(&token) {
+                result.push(PyBytes::new(py, bytes).into());
+            } else if let Some(bytes) = self.special_tokens_decoder.get(&token) {
+                result.push(PyBytes::new(py, bytes).into());
+            } else {
+                return Err(PyErr::new::<exceptions::PyKeyError, _>(token.to_string()));
+            }
+        }
+        Ok(result)
+    }
+
+    fn decode_with_offsets(&self, py: Python, tokens: Vec<Rank>) -> PyResult<(String, Vec<usize>)> {
+        let mut offsets = Vec::with_capacity(tokens.len());
+        let mut all_bytes: Vec<u8> = Vec::new();
+        let mut text_len: usize = 0;
+
+        for &token in &tokens {
+            let token_bytes = if let Some(bytes) = self.decoder.get(&token) {
+                bytes.as_slice()
+            } else if let Some(bytes) = self.special_tokens_decoder.get(&token) {
+                bytes.as_slice()
+            } else {
+                return Err(PyErr::new::<exceptions::PyKeyError, _>(token.to_string()));
+            };
+            let is_continuation = token_bytes.first().map_or(false, |&c| c >= 0x80 && c < 0xC0);
+            offsets.push(if is_continuation { text_len.saturating_sub(1) } else { text_len });
+            text_len += token_bytes.iter().filter(|&&c| !(c >= 0x80 && c < 0xC0)).count();
+            all_bytes.extend_from_slice(token_bytes);
+        }
+
+        let text = match String::from_utf8(all_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                let utf8_err = e.utf8_error();
+                let bytes = e.into_bytes();
+                return Err(PyErr::from_value(
+                    exceptions::PyUnicodeDecodeError::new_utf8(py, &bytes, utf8_err)?.into_any(),
+                ));
+            }
+        };
+
+        Ok((text, offsets))
+    }
+
     // ====================
     // Miscellaneous
     // ====================
