@@ -123,6 +123,9 @@ class Encoding:
             if match := _special_token_regex(disallowed_special).search(text):
                 raise_disallowed_special_token(match.group())
 
+        if not allowed_special and not disallowed_special:
+            return self.encode_ordinary(text)
+
         try:
             return self._core_bpe.encode(text, allowed_special)
         except UnicodeEncodeError:
